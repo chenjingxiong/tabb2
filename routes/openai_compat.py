@@ -1,6 +1,7 @@
 import json
 import time
 import uuid
+import math
 import logging
 
 from fastapi import APIRouter, HTTPException, Header
@@ -11,6 +12,10 @@ from core.tabbit_client import TabbitClient, MODEL_MAP
 from core.token_manager import TokenManager
 from core.log_store import LogStore, LogEntry
 from core.config import ConfigManager
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, math.ceil(len(text) / 4))
 
 logger = logging.getLogger("tabbit2openai")
 
@@ -91,17 +96,22 @@ async def _get_client_and_token(
 async def _stream_handler(client, session_id, content, tabbit_model, req_model, completion_id, token_name, token_id):
     start = time.time()
     error_msg = ""
+    collected_text = ""
+    prompt_tokens = _estimate_tokens(content)
     try:
         yield (
-            f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
+            f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req_model, 'system_fingerprint': f'fp_{completion_id[-12:]}', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
         )
 
         async for event in client.send_message(session_id, content, tabbit_model):
             et, ed = event["event"], event["data"]
             if et == "message_chunk" and "content" in ed:
+                collected_text += ed["content"]
                 chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req_model,
                     "choices": [
                         {
                             "index": 0,
@@ -112,8 +122,9 @@ async def _stream_handler(client, session_id, content, tabbit_model, req_model, 
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             elif et in ("message_finish", "finish"):
+                completion_tokens = _estimate_tokens(collected_text)
                 yield (
-                    f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                    f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req_model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': prompt_tokens, 'completion_tokens': completion_tokens, 'total_tokens': prompt_tokens + completion_tokens}})}\n\n"
                 )
 
         yield "data: [DONE]\n\n"
@@ -207,11 +218,15 @@ async def chat_completions(
             )
         )
 
+    prompt_tokens = estimate_tokens(content)
+    completion_tokens = estimate_tokens(full_text)
+
     return {
         "id": completion_id,
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model,
+        "system_fingerprint": f"fp_{uuid.uuid4().hex[:12]}",
         "choices": [
             {
                 "index": 0,
@@ -219,6 +234,11 @@ async def chat_completions(
                 "finish_reason": "stop",
             }
         ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
     }
 
 
